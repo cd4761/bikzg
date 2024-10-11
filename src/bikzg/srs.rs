@@ -2,19 +2,37 @@ use std::ops::Mul;
 
 use core::{marker::PhantomData, mem};
 
+use icicle_bls12_381::curve;
+use icicle_core::{error::IcicleError, msm, traits::FieldImpl};
+use icicle_cuda_runtime::{ memory::{DeviceVec, HostSlice}, stream::CudaStream};
+
 use lambdaworks_math::{
     cyclic_group::IsGroup,
     elliptic_curve::{
-        short_weierstrass::{curves::bls12_381::{curve::BLS12381Curve, default_types::FrElement}, point::ShortWeierstrassProjectivePoint},
-        traits::IsEllipticCurve,
+        short_weierstrass::{
+            curves::bls12_381::{
+                curve::{
+                    BLS12381Curve,
+                    BLS12381FieldElement
+                }, 
+                default_types::FrElement,
+                field_extension::BLS12381FieldModulus
+            }, 
+            point::ShortWeierstrassProjectivePoint
+        },
+        traits::{IsEllipticCurve, IsPairing},
     },
     traits::{AsBytes, Deserializable},
     errors::DeserializationError,
-    field::{element::FieldElement, traits::IsPrimeField},
-    elliptic_curve::traits::IsPairing,
+    field::{element::FieldElement, traits::{IsField, IsPrimeField}},
     msm::pippenger::msm,
     unsigned_integer::element::UnsignedInteger,
+    traits::ByteConversion,
+    errors::ByteConversionError,
 };
+use lambdaworks_math::field::fields::montgomery_backed_prime_fields::MontgomeryBackendPrimeField;
+
+use core::fmt::Debug;
 
 use crate::bikzg::traits::IsCommitmentScheme;
 
@@ -22,8 +40,8 @@ use lambdaworks_math::polynomial::Polynomial as UnivariatePolynomial;
 
 use rayon::prelude::*;
 
-use crate::{bipolynomial::BivariatePolynomial, G1Point};
-
+use crate::{bipolynomial::BivariatePolynomial, G1Point, bls12_381_g1_msm, BlsG1point};
+        
 #[derive(PartialEq, Clone, Debug)]
 pub struct StructuredReferenceString<G1Point, G2Point> {
     pub dimention_x: usize, 
@@ -31,6 +49,55 @@ pub struct StructuredReferenceString<G1Point, G2Point> {
     pub powers_main_group: Vec<G1Point>,
     pub powers_secondary_group: [G2Point; 3],// 1 , tau, theta 
 }
+
+// // Trait to handle scalar conversion
+// trait ToIcicle {
+//     fn to_icicle_scalar(&self) -> curve::ScalarField;
+//     fn to_icicle(&self) -> curve::BaseField;
+//     fn from_icicle(icicle: &curve::BaseField) -> Result<Self, ByteConversionError>
+//     where
+//         Self: Sized;
+// }
+
+// impl ToIcicle for BLS12381FieldElement {
+//     fn to_icicle_scalar(&self) -> curve::ScalarField {
+//         let scalar_bytes = self.to_bytes_le();
+//         curve::ScalarField::from_bytes_le(&scalar_bytes)
+//     }
+
+//     fn to_icicle(&self) -> curve::BaseField {
+//         curve::BaseField::from_bytes_le(&self.to_bytes_le())
+//     }
+
+//     fn from_icicle(icicle: &curve::BaseField) -> Result<Self, ByteConversionError> {
+//         Self::from_bytes_le(&icicle.to_bytes_le())
+//     }
+// }
+
+// // Trait for point conversion to icicle format
+// trait PointConversion {
+//     fn to_icicle(&self) -> curve::G1Affine;
+//     fn from_icicle(icicle: &curve::G1Projective) -> Result<Self, ByteConversionError>
+//     where
+//         Self: Sized;
+// }
+
+// impl PointConversion for BlsG1point {
+//     fn to_icicle(&self) -> curve::G1Affine {
+//         let s = self.to_affine();
+//         let x = s.x().to_icicle();
+//         let y = s.y().to_icicle();
+//         curve::G1Affine { x, y }
+//     }
+
+//     fn from_icicle(icicle: &curve::G1Projective) -> Result<Self, ByteConversionError> {
+//         Ok(Self::new([
+//             ToIcicle::from_icicle(&icicle.x)?,
+//             ToIcicle::from_icicle(&icicle.y)?,
+//             ToIcicle::from_icicle(&icicle.z)?,
+//         ]))
+//     }
+// }
 
 
 impl<G1Point, G2Point> StructuredReferenceString<G1Point, G2Point>
@@ -49,13 +116,14 @@ where
 
     pub fn flatten_partitioned_g1_points(&self, x_len: usize, y_len: usize) -> Vec<G1Point> {
         let mut chunk_iter = self.powers_main_group.chunks(self.dimention_x);
+        // println!("chunk_iter: {:?}", self.powers_main_group);
         let mut output: Vec<G1Point> = vec![];
         for _ in 0..y_len{
             // let dd = chunk_iter.next();
             // dd.iter().take(x_len).cloned().collect();
             output.extend( chunk_iter.next().unwrap().iter().take(x_len).cloned());
         }
-
+        // println!("output: {:?}", output);
         output
     }
 }
@@ -214,16 +282,64 @@ impl<const N: usize, F: IsPrimeField<RepresentativeType = UnsignedInteger<N>>, P
 {
     type Commitment = P::G1Point;
 
+    fn icicle_commit_bivariate(&self, bp: &BivariatePolynomial<FieldElement<F>>) -> Self::Commitment {
+        let coefficients_x_y: Vec<_> = bp.flatten_out()
+            .iter()
+            .map(|coefficient| coefficient.representative())
+            .collect();
+
+        let convert_scalars: Vec<_> = coefficients_x_y.iter()
+            .map(|coeff| {
+                let value = coeff.limbs;
+                let scalar_bytes = coeff.to_bytes_le();
+                // println!("bytes: {:?}", coeff.to_bytes_le());
+                curve::ScalarField::from_bytes_le(&scalar_bytes)
+                // value
+                //     .iter()
+                //     .map(|limb| format!("{:016x}", limb)).collect::<String>()
+            }).collect();
+
+        println!("convert: {:?}", convert);
+        let mut cfg = config.unwrap_or(msm::MSMConfig::default());
+
+        let icicle_scalars = HostSlice::from_slice(&convert_scalars);
+    
+        let convert_points = points
+            .iter()
+            .map(|point| PointConversion::to_icicle(point))
+            .collect::<Vec<_>>();
+
+        // let convert_points = curve::G1Affine { 2, 2 }
+    
+        let icicle_points = HostSlice::from_slice(&convert_points);
+    
+        let mut msm_results = DeviceVec::<curve::G1Projective>::cuda_malloc(1).unwrap();
+        let stream = CudaStream::create().unwrap();
+        cfg.ctx.stream = &stream;
+        cfg.is_async = true;
+        msm::msm(icicle_scalars, icicle_points, &cfg, &mut msm_results[..]).unwrap();
+    
+        let mut msm_host_result = vec![curve::G1Projective::zero(); 1];
+    
+        stream.synchronize().unwrap();
+        msm_results.copy_to_host(HostSlice::from_mut_slice(&mut msm_host_result[..])).unwrap();
+    
+        stream.destroy().unwrap();
+        let res = PointConversion::from_icicle(&msm_host_result[0]).unwrap();
+        res
+       
+    }
+
     fn commit_bivariate(&self, bp: &BivariatePolynomial<FieldElement<F>>) -> Self::Commitment{
         let coefficients_x_y: Vec<_> = bp.flatten_out()
             .iter()
             .map(|coefficient| coefficient.representative())
             .collect();
-        
-
+        let g1_points = &self.srs.flatten_partitioned_g1_points(bp.x_degree, bp.y_degree);
+    
         msm(
             &coefficients_x_y,
-            &self.srs.flatten_partitioned_g1_points(bp.x_degree, bp.y_degree),
+           g1_points,
         )
         .expect("`points` is sliced by `cs`'s length")
     }
@@ -235,6 +351,7 @@ impl<const N: usize, F: IsPrimeField<RepresentativeType = UnsignedInteger<N>>, P
             .map(|coefficient| coefficient.representative())
             .collect();
         let first_col_powers_main_group: Vec<_> = self.srs.powers_main_group.iter().step_by(self.srs.dimention_x).cloned().collect();
+        // println!("first_col_powers_main_group: {:?}", &first_col_powers_main_group);
         msm(
             &coefficients_y, &first_col_powers_main_group[..coefficients_y.len()]
         ).expect("`points` is sliced by `cs`'s length")
@@ -255,7 +372,9 @@ impl<const N: usize, F: IsPrimeField<RepresentativeType = UnsignedInteger<N>>, P
         let (q_xy, q_y) = poly_to_commit.ruffini_division(x,y);
         // commitment to q_y , I should change the SRS to be compatible with it 
         let q_xy_commitment = self.commit_bivariate(&q_xy);
+        let icicle_commitment = self.icicle_commit_bivariate(&q_xy);
         let q_y_commitment = self.commit_univariate(&q_y);
+        // println!("q_y_commitment: {:?}", q_y_commitment);
         (q_xy_commitment,q_y_commitment)
     }
 
@@ -362,7 +481,7 @@ mod tests {
         },
         field::element::FieldElement,
         polynomial::Polynomial,
-        traits::{AsBytes, Deserializable},
+        // traits::{AsBytes, Deserializable},
         unsigned_integer::element::U256,
     };
 
@@ -433,24 +552,19 @@ mod tests {
         let x = FieldElement::zero(); 
         let y = FrElement::from(10);
         let evaluation = bp.evaluate(&x, &y);
+        // println!("bp: {:?}", bp);
+        // println!("evaluation: {:?}", evaluation);
         let proof = bikzg.open(&x, &y, &evaluation,&bp);
         let fake_proof = (BLS12381Curve::generator(),BLS12381Curve::generator());
-        
+        // println!("proof: {:?}", proof);
 
         // assert_eq!(evaluation, FieldElement::zero());
         // assert_eq!(proof.0, BLS12381Curve::generator());
         // assert_eq!(proof.1, BLS12381Curve::generator());
         assert!(bikzg.verify(&x, &y,&evaluation, &p_commitment, &proof));
 
-
-        // let x = -FieldElement::one();
-        // let y = p.evaluate(&x);
-        // let proof = kzg.open(&x, &y, &p);
-        // assert_eq!(y, FieldElement::zero());
-        // assert_eq!(proof, BLS12381Curve::generator());
-        // assert!(kzg.verify(&x, &y, &p_commitment, &proof));
     }
-
+    // test --package bikzg --lib -- bikzg::srs::tests::kzg_1 --exact --show-output 
 
     #[test]
     fn kzg_2() {
@@ -470,25 +584,11 @@ mod tests {
         let fake_evaluation = FrElement::from(1000);
         let proof = bikzg.open(&x, &y, &fake_evaluation,&bp);
         let fake_proof = (BLS12381Curve::generator(),BLS12381Curve::generator());
-        
-
-        // assert_eq!(evaluation, FieldElement::zero());
-        // assert_eq!(proof.0, BLS12381Curve::generator());
-        // assert_eq!(proof.1, BLS12381Curve::generator());
+     
         assert!(bikzg.verify(&x, &y,&fake_evaluation, &p_commitment, &proof));
 
 
-        // let x = -FieldElement::one();
-        // let y = p.evaluate(&x);
-        // let proof = kzg.open(&x, &y, &p);
-        // assert_eq!(y, FieldElement::zero());
-        // assert_eq!(proof, BLS12381Curve::generator());
-        // assert!(kzg.verify(&x, &y, &p_commitment, &proof));
     }
-
-
-
-
 
     #[test]
     fn test_vandemonde_challenge() {
